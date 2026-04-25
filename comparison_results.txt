@@ -1,0 +1,8 @@
+MODEL COMPARISON RESULTS
+==================================================
+
+Traditional ML Accuracy: 86.12%
+SNN Accuracy: 50.00%
+
+Traditional ML Time: 0.0020s
+SNN Time: 2.0112s
