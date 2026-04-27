@@ -5,15 +5,16 @@ import torch.nn as nn
 import torch.optim as optim
 import librosa
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 import joblib
+import time
+import psutil
+import tracemalloc
 
 
-# ==============================
-# CONFIG
-# ==============================
 selected_words = ["yes", "no"]
 MAX_SAMPLES_PER_CLASS = 500
-TIME_STEPS = 30       # Matches Test&Compere.py (T=30 in SNNLayer.forward)
+TIME_STEPS = 30
 HIDDEN_SIZE = 64
 EPOCHS = 30
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -21,18 +22,11 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {DEVICE}")
 
 
-# ==============================
-# SURROGATE SPIKE FUNCTION
-# ==============================
-# Problem: the real spike function (step function) has zero gradient everywhere.
-# Backpropagation needs a gradient to learn. Solution: use a smooth fake
-# gradient only during the backward pass. This is called a surrogate gradient.
 class SurrogateSpikeFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, threshold=0.5):
         ctx.save_for_backward(input)
         ctx.threshold = threshold
-        # Forward pass: real spikes (0 or 1)
         return (input > threshold).float()
 
     @staticmethod
@@ -41,50 +35,31 @@ class SurrogateSpikeFunction(torch.autograd.Function):
         threshold = ctx.threshold
         beta = 5.0
         grad_input = grad_output.clone()
-        # Backward pass: smooth approximation (surrogate)
         surrogate = 1 / (1 + beta * torch.abs(input - threshold)) ** 2
         return grad_input * surrogate, None
 
 
-# ==============================
-# LIF (LEAKY INTEGRATE-AND-FIRE) NEURON
-# ==============================
-# Holds its own internal membrane potential state.
-# Each call to forward() is one timestep.
 class SpikingNeuron(nn.Module):
     def __init__(self, size, threshold=0.5, decay=0.9):
         super().__init__()
         self.threshold = threshold
         self.decay = decay
-        self.mem = None          # Membrane potential (internal state)
+        self.mem = None
         self.spike_fn = SurrogateSpikeFunction.apply
         self.size = size
 
     def reset(self, batch_size=1, device='cpu'):
-        """Reset membrane potential to zero. Call before each new batch."""
         self.mem = torch.zeros(batch_size, self.size, device=device)
 
     def forward(self, x):
         if self.mem is None:
             self.reset(batch_size=x.shape[0], device=x.device)
-        # FIX: detach mem from the previous timestep's computation graph.
-        # Without this, PyTorch chains all 30 timesteps into one graph.
-        # When backward() frees that graph after the first batch, the next
-        # batch tries to backward through already-freed tensors -> crash.
-        # detach() cuts the chain: each timestep's graph is independent.
         self.mem = self.decay * self.mem.detach() + x
-        # Fire: emit spike if membrane crossed threshold
         spike = self.spike_fn(self.mem, self.threshold)
-        # Reset: subtract threshold worth of potential after firing
         self.mem = self.mem - spike * self.threshold
         return spike
 
 
-# ==============================
-# SNN LAYER
-# ==============================
-# One fully-connected layer of spiking neurons.
-# Runs the same input through T timesteps and returns average spike rate.
 class SNNLayer(nn.Module):
     def __init__(self, in_features, out_features):
         super().__init__()
@@ -96,21 +71,15 @@ class SNNLayer(nn.Module):
         self.neuron.reset(batch_size=batch_size, device=device)
 
     def forward(self, x, T=TIME_STEPS):
-        self.reset(batch_size=x.shape[0], device=x.device)  # reset at start of each forward pass
+        self.reset(batch_size=x.shape[0], device=x.device)
         spike_sum = torch.zeros(x.shape[0], self.weights.shape[1], device=x.device)
         for t in range(T):
             cur = torch.matmul(x, self.weights) + self.bias
             spk = self.neuron(cur)
             spike_sum += spk
-        # Return average firing rate over all timesteps
         return spike_sum / T
 
 
-# ==============================
-# FULL SNN MODEL (CustomSNN)
-# ==============================
-# This is the SAME architecture used in Test&Compere.py.
-# Training and testing must use identical architecture or weights won't load.
 class CustomSNN(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
         super().__init__()
@@ -127,24 +96,14 @@ class CustomSNN(nn.Module):
         self.output.reset(batch_size=batch_size, device=device)
 
 
-# ==============================
-# DATASET DOWNLOAD
-# ==============================
-# ==============================
-# DATASET PATH (LOCAL)
-# ==============================
 DATASET_PATH = r"E:\CE-45\sem6\DSP\dataset"
 
-# Optional: verify structure
 if not os.path.exists(DATASET_PATH):
     raise FileNotFoundError(f"Dataset path not found: {DATASET_PATH}")
 
 print(f"Using LOCAL dataset path: {DATASET_PATH}")
 
 
-# ==============================
-# DATA LOADING
-# ==============================
 def load_data():
     X, y = [], []
     print(f"Loading balanced dataset ({MAX_SAMPLES_PER_CLASS} per class)...")
@@ -166,13 +125,11 @@ def load_data():
             try:
                 signal, sr = librosa.load(path, sr=16000)
 
-                # Pad or trim to exactly 1 second
                 if len(signal) < 16000:
                     signal = np.pad(signal, (0, 16000 - len(signal)))
                 else:
                     signal = signal[:16000]
 
-                # Extract 13 MFCC features (averaged over time)
                 mfcc = librosa.feature.mfcc(y=signal, sr=sr, n_mfcc=13)
                 feature = np.mean(mfcc.T, axis=0)
 
@@ -186,15 +143,11 @@ def load_data():
 
 
 def normalize(X):
-    """Scale features to [0, 1] range. Required for spike rate coding."""
     X_min = X.min(axis=0)
     X_max = X.max(axis=0)
     return (X - X_min) / (X_max - X_min + 1e-8), X_min, X_max
 
 
-# ==============================
-# TRAINING LOOP
-# ==============================
 def train(model, X_train, y_train, X_test, y_test):
     model.to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
@@ -202,15 +155,14 @@ def train(model, X_train, y_train, X_test, y_test):
 
     X_train_t = torch.tensor(X_train, dtype=torch.float32).to(DEVICE)
     y_train_t = torch.tensor(y_train, dtype=torch.long).to(DEVICE)
-    X_test_t  = torch.tensor(X_test,  dtype=torch.float32).to(DEVICE)
-    y_test_t  = torch.tensor(y_test,  dtype=torch.long).to(DEVICE)
+    X_test_t = torch.tensor(X_test, dtype=torch.float32).to(DEVICE)
+    y_test_t = torch.tensor(y_test, dtype=torch.long).to(DEVICE)
 
     best_acc = 0.0
 
     for epoch in range(EPOCHS):
         model.train()
 
-        # Shuffle training data each epoch
         perm = torch.randperm(X_train_t.size(0))
         total_loss = 0
 
@@ -228,7 +180,6 @@ def train(model, X_train, y_train, X_test, y_test):
 
             total_loss += loss.item()
 
-        # Evaluate on test set
         model.eval()
         with torch.no_grad():
             preds = model(X_test_t).argmax(dim=1)
@@ -241,35 +192,36 @@ def train(model, X_train, y_train, X_test, y_test):
 
     print(f"\nBest accuracy during training: {best_acc:.4f}")
 
+    model.eval()
+    with torch.no_grad():
+        final_preds = model(X_test_t).argmax(dim=1).cpu().numpy()
 
-# ==============================
-# MAIN
-# ==============================
+    return final_preds
+
+
 def main():
-    # Load data
+    process = psutil.Process()
+    tracemalloc.start()
+    start_total_time = time.time()
+
     X, y_labels = load_data()
     print(f"\nTotal samples: {len(X)}")
 
     unique, counts = np.unique(y_labels, return_counts=True)
     print(f"Class distribution: {dict(zip(unique, counts))}")
 
-    # Build label map: word -> integer index
-    # sorted() ensures consistent ordering across runs
     label_map = {word: i for i, word in enumerate(sorted(np.unique(y_labels)))}
     print(f"Label mapping: {label_map}")
     y = np.array([label_map[word] for word in y_labels])
 
-    # Normalize to [0, 1] and keep min/max for inference time
     X_norm, X_min, X_max = normalize(X)
     print(f"Feature range after normalization: {X_norm.min():.3f} to {X_norm.max():.3f}")
 
-    # Train/test split (stratified = equal class balance in both splits)
     X_train, X_test, y_train, y_test = train_test_split(
         X_norm, y, test_size=0.2, stratify=y, random_state=42
     )
     print(f"Train: {len(X_train)} | Test: {len(X_test)}")
 
-    # Build model — SAME architecture as Test&Compere.py CustomSNN
     model = CustomSNN(
         input_size=13,
         hidden_size=HIDDEN_SIZE,
@@ -277,21 +229,117 @@ def main():
     )
     print(f"\nModel architecture: 13 -> {HIDDEN_SIZE} -> 2")
 
-    # Train
-    print("\nStarting training...")
-    train(model, X_train, y_train, X_test, y_test)
+    torch.save(model.state_dict(), 'temp_model.pth')
+    model_size_bytes = os.path.getsize('temp_model.pth')
+    model_size_mb = model_size_bytes / (1024 * 1024)
+    os.remove('temp_model.pth')
 
-    # ==============================
-    # SAVE FULL CHECKPOINT
-    # ==============================
-    # IMPORTANT: Save everything the test file needs in ONE dictionary.
-    # Test&Compere.py expects: model_state_dict, X_min, X_max, label_mapping,
-    # input_size, hidden_size, output_size
+    cpu_percent_before = process.cpu_percent(interval=0.5)
+    ram_mb_before = process.memory_info().rss / (1024 * 1024)
+
+    print("\nStarting training...")
+    start_train_time = time.time()
+    y_pred = train(model, X_train, y_train, X_test, y_test)
+    train_time = time.time() - start_train_time
+
+    cpu_percent_after = process.cpu_percent(interval=0.5)
+    ram_mb_after = process.memory_info().rss / (1024 * 1024)
+
+    cpu_percent = (cpu_percent_before + cpu_percent_after) / 2
+    ram_mb = max(ram_mb_before, ram_mb_after)
+
+    X_test_20 = X_test[:20] if len(X_test) >= 20 else X_test
+    y_test_20 = y_test[:20]
+
+    latencies = []
+    spike_rates = []
+    silent_neurons_count = 0
+
+    model.eval()
+    with torch.no_grad():
+        for i, sample in enumerate(X_test_20):
+            sample_tensor = torch.tensor(sample.reshape(1, -1), dtype=torch.float32).to(DEVICE)
+
+            start_time = time.time()
+
+            model.reset(batch_size=1, device=DEVICE)
+            x = sample_tensor
+            x = model.hidden(x)
+
+            hidden_spikes = model.hidden.neuron.mem if model.hidden.neuron.mem is not None else torch.zeros(1,
+                                                                                                            HIDDEN_SIZE)
+            spike_rate = (hidden_spikes > 0.5).float().mean().item()
+            spike_rates.append(spike_rate)
+
+            x = model.output(x)
+
+            latency = (time.time() - start_time) * 1000
+            latencies.append(latency)
+
+    avg_latency = np.mean(latencies)
+
+    avg_spike_rate = np.mean(spike_rates)
+
+    with torch.no_grad():
+        model.reset(batch_size=len(X_test_20), device=DEVICE)
+        X_test_20_tensor = torch.tensor(X_test_20, dtype=torch.float32).to(DEVICE)
+        _ = model.hidden(X_test_20_tensor)
+        all_spikes = model.hidden.neuron.mem
+        silent_neurons = (all_spikes < 0.01).float().mean().item() * 100
+
+    silent_percent = silent_neurons
+
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred, average='macro')
+    recall = recall_score(y_test, y_pred, average='macro')
+    f1 = f1_score(y_test, y_pred, average='macro')
+
+    y_pred_20 = []
+    model.eval()
+    with torch.no_grad():
+        for sample in X_test_20:
+            sample_tensor = torch.tensor(sample.reshape(1, -1), dtype=torch.float32).to(DEVICE)
+            output = model(sample_tensor)
+            pred = output.argmax(dim=1).item()
+            y_pred_20.append(pred)
+
+    correct_predictions_20 = np.sum(np.array(y_pred_20) == y_test_20[:len(y_pred_20)])
+
+    current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    total_time = time.time() - start_total_time
+
+    print("\n" + "=" * 60)
+    print("SNN MODEL METRICS REPORT")
+    print("=" * 60)
+
+    print("\n✔ Metrics:")
+    print(f"  accuracy: {accuracy:.4f}")
+    print(f"  precision: {precision:.4f}")
+    print(f"  recall: {recall:.4f}")
+    print(f"  f1: {f1:.4f}")
+
+    print("\n✔ Performance:")
+    print(f"  latency: {avg_latency:.2f} ms (average over 20 samples)")
+    print(f"  CPU %: {cpu_percent:.1f}%")
+    print(f"  RAM usage: {ram_mb:.2f} MB")
+    print(f"  model size: {model_size_mb:.2f} MB")
+
+    print("\n✔ SNN-specific:")
+    print(f"  spike rate: {avg_spike_rate:.4f} (average firing rate)")
+    print(f"  silent %: {silent_percent:.2f}% (neurons with spike rate < 0.01)")
+
+    print("\n✔ Generalization:")
+    print(f"  correct predictions out of 20: {correct_predictions_20}/{len(X_test_20)}")
+
+    print("=" * 60)
+
     checkpoint = {
-        'model_state_dict': model.state_dict(),   # Trained weights
-        'X_min': X_min,                            # For normalizing new samples
-        'X_max': X_max,                            # For normalizing new samples
-        'label_mapping': label_map,                # e.g. {'no': 0, 'yes': 1}
+        'model_state_dict': model.state_dict(),
+        'X_min': X_min,
+        'X_max': X_max,
+        'label_mapping': label_map,
         'input_size': 13,
         'hidden_size': HIDDEN_SIZE,
         'output_size': 2,

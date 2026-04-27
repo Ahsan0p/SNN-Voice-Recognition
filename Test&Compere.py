@@ -2,7 +2,7 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-import librosa  # FIXED: Changed from librosa1 to librosa
+import librosa
 import sounddevice as sd
 import soundfile as sf
 import joblib
@@ -11,9 +11,6 @@ from tabulate import tabulate
 import matplotlib.pyplot as plt
 
 
-# ==============================
-# EXACT SNN ARCHITECTURE (MATCHING TRAINING)
-# ==============================
 class SurrogateSpikeFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, threshold=0.5):
@@ -63,9 +60,8 @@ class SNNLayer(nn.Module):
         self.neuron.reset()
 
     def forward(self, x, T=30):
-        # FIXED: Use same device as input
         spike_sum = torch.zeros(x.shape[0], self.weights.shape[1], device=x.device)
-        spike_counts = []  # Track spikes per timestep
+        spike_counts = []
 
         for t in range(T):
             cur = torch.matmul(x, self.weights) + self.bias
@@ -81,7 +77,7 @@ class CustomSNN(nn.Module):
         super().__init__()
         self.hidden = SNNLayer(input_size, hidden_size)
         self.output = SNNLayer(hidden_size, output_size)
-        self.timesteps = 30  # Store timesteps for spike tracking
+        self.timesteps = 30
 
     def forward(self, x):
         hidden_out, hidden_spikes = self.hidden(x)
@@ -93,11 +89,7 @@ class CustomSNN(nn.Module):
         self.output.reset()
 
 
-# ==============================
-# AUDIO PROCESSING
-# ==============================
 def record_audio(duration=1.0, sample_rate=16000):
-    """Record from microphone"""
     print(f"\n🎤 Recording for {duration} seconds...")
     recording = sd.rec(int(duration * sample_rate),
                        samplerate=sample_rate,
@@ -110,7 +102,6 @@ def record_audio(duration=1.0, sample_rate=16000):
 
 
 def extract_features(audio, sr=16000):
-    """Extract MFCC features (same as training)"""
     if len(audio) < sr:
         audio = np.pad(audio, (0, sr - len(audio)))
     else:
@@ -121,11 +112,7 @@ def extract_features(audio, sr=16000):
     return features
 
 
-# ==============================
-# LOAD MODELS (FIXED VERSION)
-# ==============================
 def load_traditional_model():
-    """Load Logistic Regression model"""
     try:
         model = joblib.load('traditional_model.pkl')
         encoder = joblib.load('label_encoder.pkl')
@@ -137,32 +124,25 @@ def load_traditional_model():
 
 
 def load_snn_model():
-    """Load SNN model with ALL fixes applied"""
     try:
-        # FIX 1: Correct filename
         checkpoint = torch.load(
-            'snn_model_fast.pth',  # Changed from snn_model_fixed.pth
+            'snn_model_fast.pth',
             map_location='cpu',
-            weights_only=False  # FIX: Required for PyTorch 2.6+
+            weights_only=False
         )
 
-        # Extract metadata
         input_size = checkpoint.get('input_size', 13)
         hidden_size = checkpoint.get('hidden_size', 64)
         output_size = checkpoint.get('output_size', 2)
 
-        # Create model with EXACT same architecture
         model = CustomSNN(input_size, hidden_size, output_size)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
 
-        # Get normalization parameters
         X_min = checkpoint.get('X_min', None)
         X_max = checkpoint.get('X_max', None)
 
-        # FIX 2: Correct label mapping reversal
         label_mapping = checkpoint.get('label_mapping', {'yes': 0, 'no': 1})
-        # Reverse mapping: index -> label
         idx_to_label = {v: k for k, v in label_mapping.items()}
 
         print(f"✅ SNN model loaded successfully")
@@ -182,11 +162,7 @@ def load_snn_model():
         return None, None, None, None
 
 
-# ==============================
-# PREDICTIONS WITH SNN METRICS
-# ==============================
 def predict_traditional(model, encoder, features):
-    """Traditional model prediction"""
     start = time.time()
     features_2d = features.reshape(1, -1)
     pred = model.predict(features_2d)[0]
@@ -199,20 +175,15 @@ def predict_traditional(model, encoder, features):
 
 
 def calculate_spike_rate(hidden_spikes, output_spikes, timesteps=30):
-    """Calculate average spike rate across all neurons and timesteps"""
-    # Convert spike lists to numpy arrays
-    hidden_spikes_array = np.array(hidden_spikes)  # Shape: (timesteps, batch, neurons)
+    hidden_spikes_array = np.array(hidden_spikes)
     output_spikes_array = np.array(output_spikes)
 
-    # Count total spikes
     total_spikes = np.sum(hidden_spikes_array) + np.sum(output_spikes_array)
 
-    # Calculate total neurons
     hidden_neurons = hidden_spikes_array.shape[2] if len(hidden_spikes_array.shape) > 2 else 0
     output_neurons = output_spikes_array.shape[2] if len(output_spikes_array.shape) > 2 else 0
     total_neurons = hidden_neurons + output_neurons
 
-    # Calculate spike rate (spikes per neuron per timestep)
     if total_neurons > 0:
         spike_rate = total_spikes / (total_neurons * timesteps)
     else:
@@ -222,15 +193,11 @@ def calculate_spike_rate(hidden_spikes, output_spikes, timesteps=30):
 
 
 def estimate_energy(spike_rate, total_spikes, features, num_classes=2):
-    """Estimate energy consumption for SNN vs Traditional ANN"""
-    # Energy constants (approximate research values)
-    ENERGY_PER_SPIKE = 1.0  # Arbitrary unit for SNN
-    ENERGY_PER_MAC = 10.0  # Traditional ANN requires much more energy
+    ENERGY_PER_SPIKE = 1.0
+    ENERGY_PER_MAC = 10.0
 
-    # SNN energy (proportional to spikes)
     snn_energy = total_spikes * ENERGY_PER_SPIKE
 
-    # Traditional model energy (based on MAC operations)
     num_features = len(features)
     trad_energy = num_features * num_classes * ENERGY_PER_MAC
 
@@ -238,19 +205,15 @@ def estimate_energy(spike_rate, total_spikes, features, num_classes=2):
 
 
 def predict_snn(model, features, X_min, X_max, idx_to_label):
-    """SNN prediction with spike rate and energy tracking"""
     start = time.time()
 
-    # Normalize features (CRITICAL - same as training)
     if X_min is not None and X_max is not None:
         features = (features - X_min) / (X_max - X_min + 1e-8)
 
-    # Convert to tensor
     x = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
 
-    # Predict with spike tracking
     with torch.no_grad():
-        model.reset()  # Reset neuron states
+        model.reset()
         output, hidden_spikes, output_spikes = model(x)
         probs = torch.softmax(output, dim=1)
         confidence = torch.max(probs).item() * 100
@@ -258,20 +221,14 @@ def predict_snn(model, features, X_min, X_max, idx_to_label):
 
     inference_time = (time.time() - start) * 1000
 
-    # Calculate spike metrics
     spike_rate, total_spikes = calculate_spike_rate(hidden_spikes, output_spikes, timesteps=model.timesteps)
 
-    # Estimate energy
     snn_energy, trad_energy = estimate_energy(spike_rate, total_spikes, features)
 
-    # FIXED: Use reversed mapping
     word = idx_to_label.get(pred_idx, 'unknown')
     return word, confidence, inference_time, spike_rate, total_spikes, snn_energy, trad_energy
 
 
-# ==============================
-# RESULTS TRACKING WITH ENHANCED METRICS
-# ==============================
 class ComparisonTracker:
     def __init__(self):
         self.results = []
@@ -321,12 +278,10 @@ class ComparisonTracker:
         }
 
     def get_confusion_matrices(self):
-        """Get confusion matrices for both models"""
         trad_cm = {'TP': 0, 'TN': 0, 'FP': 0, 'FN': 0}
         snn_cm = {'TP': 0, 'TN': 0, 'FP': 0, 'FN': 0}
 
         for r in self.results:
-            # Traditional
             if r['true'] == 'yes' and r['trad_pred'] == 'yes':
                 trad_cm['TP'] += 1
             elif r['true'] == 'yes' and r['trad_pred'] == 'no':
@@ -336,7 +291,6 @@ class ComparisonTracker:
             elif r['true'] == 'no' and r['trad_pred'] == 'no':
                 trad_cm['TN'] += 1
 
-            # SNN
             if r['true'] == 'yes' and r['snn_pred'] == 'yes':
                 snn_cm['TP'] += 1
             elif r['true'] == 'yes' and r['snn_pred'] == 'no':
@@ -349,20 +303,15 @@ class ComparisonTracker:
         return trad_cm, snn_cm
 
 
-# ==============================
-# DISPLAY FUNCTIONS
-# ==============================
 def print_results(true_label, trad_word, trad_conf, trad_time, trad_correct,
                   snn_word, snn_conf, snn_time, snn_correct,
                   spike_rate, snn_energy, trad_energy):
-    """Display individual prediction results with SNN metrics"""
     print("\n" + "=" * 70)
     print("🎯 PREDICTION RESULTS")
     print("=" * 70)
     print(f"🎤 Actual: {true_label.upper()}")
     print("-" * 70)
 
-    # Traditional model
     trad_symbol = "✅" if trad_correct else "❌"
     print(f"📊 TRADITIONAL (Logistic Regression):")
     print(f"   Prediction: {trad_word.upper()} {trad_symbol}")
@@ -372,7 +321,6 @@ def print_results(true_label, trad_word, trad_conf, trad_time, trad_correct,
 
     print("-" * 70)
 
-    # SNN model
     snn_symbol = "✅" if snn_correct else "❌"
     print(f"🧠 SNN (Spiking Neural Network):")
     print(f"   Prediction: {snn_word.upper()} {snn_symbol}")
@@ -385,12 +333,10 @@ def print_results(true_label, trad_word, trad_conf, trad_time, trad_correct,
 
 
 def print_detailed_report(metrics, trad_cm, snn_cm):
-    """Print comprehensive comparison report with SNN metrics"""
     print("\n" + "=" * 80)
     print("📊 DETAILED MODEL COMPARISON REPORT")
     print("=" * 80)
 
-    # Main metrics table with SNN-specific metrics
     table = [
         ["Metric", "Traditional (LR)", "SNN", "Winner"],
         ["-" * 30, "-" * 20, "-" * 20, "-" * 15],
@@ -420,7 +366,6 @@ def print_detailed_report(metrics, trad_cm, snn_cm):
 
     print(tabulate(table, headers="firstrow", tablefmt="grid"))
 
-    # Confusion matrices
     print("\n📈 CONFUSION MATRICES:")
     print("-" * 50)
 
@@ -450,7 +395,6 @@ def print_detailed_report(metrics, trad_cm, snn_cm):
         snn_recall = snn_cm['TP'] / (snn_cm['TP'] + snn_cm['FN']) * 100
         print(f"   Recall: {snn_recall:.2f}%")
 
-    # Energy efficiency analysis
     print("\n⚡ ENERGY EFFICIENCY ANALYSIS:")
     print("-" * 50)
     energy_ratio = metrics['snn']['avg_energy'] / metrics['trad']['avg_energy']
@@ -462,7 +406,6 @@ def print_detailed_report(metrics, trad_cm, snn_cm):
 
     print(f"🧠 Average SNN spike rate: {metrics['snn']['avg_spike_rate']:.4f} spikes/neuron/timestep")
 
-    # Analysis and recommendation
     print("\n📈 PERFORMANCE ANALYSIS:")
     print("-" * 50)
 
@@ -476,15 +419,12 @@ def print_detailed_report(metrics, trad_cm, snn_cm):
 
     speed_diff = abs(metrics['trad']['avg_time'] - metrics['snn']['avg_time'])
     if metrics['trad']['avg_time'] < metrics['snn']['avg_time']:
-        print(
-            f"⚡ Traditional model is {speed_diff:.2f}ms FASTER ({speed_diff / metrics['snn']['avg_time'] * 100:.1f}% faster)")
+        print(f"⚡ Traditional model is {speed_diff:.2f}ms FASTER ({speed_diff / metrics['snn']['avg_time'] * 100:.1f}% faster)")
     elif metrics['snn']['avg_time'] < metrics['trad']['avg_time']:
-        print(
-            f"⚡ SNN model is {speed_diff:.2f}ms FASTER ({speed_diff / metrics['trad']['avg_time'] * 100:.1f}% faster)")
+        print(f"⚡ SNN model is {speed_diff:.2f}ms FASTER ({speed_diff / metrics['trad']['avg_time'] * 100:.1f}% faster)")
     else:
         print(f"⚡ Both models have EQUAL speed")
 
-    # Recommendation
     print("\n💡 FINAL RECOMMENDATION:")
     print("-" * 50)
 
@@ -506,16 +446,12 @@ def print_detailed_report(metrics, trad_cm, snn_cm):
         print("   📌 SNN offers advantages for spatiotemporal processing and hardware efficiency")
 
 
-# ==============================
-# MAIN APPLICATION
-# ==============================
 def main():
     print("=" * 70)
     print("🎯 VOICE COMMAND COMPARISON SYSTEM")
     print("Traditional (LR) vs Spiking Neural Network (SNN)")
     print("=" * 70)
 
-    # Load models
     trad_model, encoder = load_traditional_model()
     snn_model, X_min, X_max, idx_to_label = load_snn_model()
 
@@ -541,7 +477,6 @@ def main():
         choice = input("\n👉 Choose (1-5): ").strip()
 
         if choice == '1':
-            # Record from microphone
             true_label = input("What command will you say? (yes/no): ").strip().lower()
             if true_label not in ['yes', 'no']:
                 print("❌ Invalid command! Use 'yes' or 'no'")
@@ -551,7 +486,6 @@ def main():
             audio = record_audio()
 
         elif choice == '2':
-            # Test with file
             filepath = input("Enter WAV file path: ").strip()
             if not os.path.exists(filepath):
                 print("❌ File not found!")
@@ -568,18 +502,15 @@ def main():
                 continue
 
         elif choice == '3':
-            # Show report
             metrics = tracker.get_metrics()
             if metrics:
                 trad_cm, snn_cm = tracker.get_confusion_matrices()
                 print_detailed_report(metrics, trad_cm, snn_cm)
 
-                # Generate visualization if enough data
                 if metrics['n'] > 1:
                     try:
                         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-                        # Accuracy comparison
                         axes[0, 0].bar(['Traditional', 'SNN'],
                                        [metrics['trad']['accuracy'], metrics['snn']['accuracy']],
                                        color=['#2ecc71', '#e74c3c'])
@@ -589,7 +520,6 @@ def main():
                         for i, v in enumerate([metrics['trad']['accuracy'], metrics['snn']['accuracy']]):
                             axes[0, 0].text(i, v + 1, f'{v:.1f}%', ha='center', fontsize=12, fontweight='bold')
 
-                        # Time comparison
                         axes[0, 1].bar(['Traditional', 'SNN'],
                                        [metrics['trad']['avg_time'], metrics['snn']['avg_time']],
                                        color=['#2ecc71', '#e74c3c'])
@@ -598,7 +528,6 @@ def main():
                         for i, v in enumerate([metrics['trad']['avg_time'], metrics['snn']['avg_time']]):
                             axes[0, 1].text(i, v + 0.5, f'{v:.1f}ms', ha='center', fontsize=12, fontweight='bold')
 
-                        # Energy comparison
                         axes[1, 0].bar(['Traditional', 'SNN'],
                                        [metrics['trad']['avg_energy'], metrics['snn']['avg_energy']],
                                        color=['#2ecc71', '#e74c3c'])
@@ -607,7 +536,6 @@ def main():
                         for i, v in enumerate([metrics['trad']['avg_energy'], metrics['snn']['avg_energy']]):
                             axes[1, 0].text(i, v + 0.1, f'{v:.1f}', ha='center', fontsize=12, fontweight='bold')
 
-                        # Spike rate (only for SNN)
                         axes[1, 1].bar(['SNN Spike Rate'], [metrics['snn']['avg_spike_rate']],
                                        color=['#3498db'])
                         axes[1, 1].set_ylabel('Spikes/Neuron/Timestep')
@@ -637,15 +565,12 @@ def main():
             print("❌ Invalid choice! Enter 1-5")
             continue
 
-        # Extract features and predict
         features = extract_features(audio)
 
-        # Traditional prediction
         trad_word, trad_conf, trad_time = predict_traditional(trad_model, encoder, features)
         trad_correct = trad_word == true_label
-        trad_energy = len(features) * 2 * 10  # features * classes * ENERGY_PER_MAC
+        trad_energy = len(features) * 2 * 10
 
-        # SNN prediction (if available)
         if snn_model:
             snn_word, snn_conf, snn_time, spike_rate, total_spikes, snn_energy, _ = predict_snn(
                 snn_model, features, X_min, X_max, idx_to_label
@@ -655,18 +580,15 @@ def main():
             snn_word, snn_conf, snn_time, spike_rate, snn_energy, snn_correct = "N/A", 0, 0, 0, 0, False
             trad_energy = 0
 
-        # Store results
         tracker.add_result(true_label, trad_word, snn_word,
                            trad_conf, snn_conf,
                            trad_time, snn_time,
                            spike_rate, snn_energy, trad_energy)
 
-        # Display
         print_results(true_label, trad_word, trad_conf, trad_time, trad_correct,
                       snn_word, snn_conf, snn_time, snn_correct,
                       spike_rate, snn_energy, trad_energy)
 
-        # Show cumulative accuracy
         metrics = tracker.get_metrics()
         if metrics:
             print(f"\n📈 Cumulative Performance:")
@@ -677,7 +599,6 @@ def main():
 
 
 if __name__ == "__main__":
-    # Check for required packages
     missing_packages = []
     for package in ['sounddevice', 'tabulate', 'matplotlib', 'soundfile']:
         try:
