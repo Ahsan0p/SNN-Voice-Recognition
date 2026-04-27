@@ -4,32 +4,23 @@ import librosa
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report
 import joblib
+import time
+import psutil
+import tracemalloc
 
 
 
-# ==============================
-# DATASET DOWNLOAD (KaggleHub)
-# ==============================
-import kagglehub
+DATASET_PATH = r"E:\CE-45\sem6\DSP\dataset"
 
-print("Downloading dataset from Kaggle...")
-_dl_root = kagglehub.dataset_download("neehakurelli/google-speech-commands")
+if not os.path.exists(DATASET_PATH):
+    raise FileNotFoundError(f"Dataset path not found: {DATASET_PATH}")
 
-DATASET_PATH = _dl_root
-for _root, _dirs, _files in os.walk(_dl_root):
-    if "yes" in _dirs and "no" in _dirs:
-        DATASET_PATH = _root
-        break
-
-print(f"Dataset ready at: {DATASET_PATH}")
+print(f"Using LOCAL dataset path: {DATASET_PATH}")
 selected_words = ["yes", "no"]
 
 
-# ==============================
-# LOAD AND PREPROCESS
-# ==============================
 def load_and_preprocess():
     signals = []
     labels = []
@@ -54,7 +45,6 @@ def load_and_preprocess():
             try:
                 signal, sr = librosa.load(path, sr=16000)
 
-                # Fix length to exactly 1 second (16000 samples)
                 if len(signal) < 16000:
                     signal = np.pad(signal, (0, 16000 - len(signal)))
                 else:
@@ -74,13 +64,9 @@ def extract_mfcc(signal, sr=16000):
         y=signal, sr=sr, n_mfcc=13,
         n_fft=512, hop_length=256
     )
-    # Average across time frames -> shape (13,)
     return np.mean(mfcc.T, axis=0)
 
 
-# ==============================
-# MAIN
-# ==============================
 print("\nLoading data...")
 signals, labels = load_and_preprocess()
 print(f"Total samples loaded: {len(signals)}")
@@ -89,30 +75,85 @@ print("Extracting MFCC features...")
 features = [extract_mfcc(s) for s in signals]
 X = np.array(features)
 
-# Encode labels: "no" -> 0, "yes" -> 1 (alphabetical by default)
 le = LabelEncoder()
 y = le.fit_transform(labels)
 print(f"Label mapping: {dict(zip(le.classes_, le.transform(le.classes_)))}")
 
-# Split data: 80% train, 20% test
 X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.2, random_state=42, stratify=y
 )
 print(f"Train samples: {len(X_train)} | Test samples: {len(X_test)}")
 
-# Train Logistic Regression
+process = psutil.Process()
+tracemalloc.start()
+
+test_indices = np.random.choice(len(X_test), min(20, len(X_test)), replace=False)
+X_test_20 = X_test[test_indices]
+y_test_20 = y_test[test_indices]
+
 print("\nTraining Logistic Regression...")
+start_time = time.time()
 model = LogisticRegression(max_iter=1000, random_state=42)
 model.fit(X_train, y_train)
+training_time = time.time() - start_time
 
-# Evaluate
+model_size_bytes = os.path.getsize('traditional_model.pkl') if os.path.exists('traditional_model.pkl') else 0
+joblib.dump(model, 'traditional_model.pkl')
+model_size_bytes = os.path.getsize('traditional_model.pkl')
+model_size_mb = model_size_bytes / (1024 * 1024)
+
+cpu_percent = process.cpu_percent(interval=1)
+ram_mb = process.memory_info().rss / (1024 * 1024)
+
+latencies = []
+for sample in X_test_20:
+    start_time = time.time()
+    _ = model.predict(sample.reshape(1, -1))
+    latencies.append(time.time() - start_time)
+avg_latency = np.mean(latencies) * 1000
+
 y_pred = model.predict(X_test)
 accuracy = accuracy_score(y_test, y_pred)
+
+precision = precision_score(y_test, y_pred, average='macro')
+recall = recall_score(y_test, y_pred, average='macro')
+f1 = f1_score(y_test, y_pred, average='macro')
+
+y_pred_20 = model.predict(X_test_20)
+correct_predictions_20 = np.sum(y_pred_20 == y_test_20)
+
+current, peak = tracemalloc.get_traced_memory()
+tracemalloc.stop()
+
+print("\n" + "="*60)
+print("TRADITIONAL MODEL METRICS REPORT")
+print("="*60)
+
+print("\n✔ Metrics:")
+print(f"  accuracy: {accuracy:.4f}")
+print(f"  precision: {precision:.4f}")
+print(f"  recall: {recall:.4f}")
+print(f"  f1: {f1:.4f}")
+
+print("\n✔ Performance:")
+print(f"  latency: {avg_latency:.2f} ms (average over 20 samples)")
+print(f"  CPU %: {cpu_percent:.1f}%")
+print(f"  RAM usage: {ram_mb:.2f} MB")
+print(f"  model size: {model_size_mb:.2f} MB")
+
+print("\n✔ SNN-specific:")
+print(f"  spike rate: N/A (not applicable for traditional model)")
+print(f"  silent %: N/A (not applicable for traditional model)")
+
+print("\n✔ Generalization:")
+print(f"  correct predictions out of 20: {correct_predictions_20}/20")
+
+print("="*60)
+
 print(f"\nTraditional ML Accuracy: {accuracy:.4f}")
 print("\nClassification Report:")
 print(classification_report(y_test, y_pred, target_names=le.classes_))
 
-# Save model, encoder, and test data
 joblib.dump(model, 'traditional_model.pkl')
 joblib.dump(le, 'label_encoder.pkl')
 joblib.dump((X_test, y_test), 'test_data.pkl')
