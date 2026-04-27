@@ -10,15 +10,20 @@ import joblib
 
 
 # ==============================
-# DATASET PATH (LOCAL)
+# DATASET DOWNLOAD (KaggleHub)
 # ==============================
-DATASET_PATH = r"E:\CE-45\sem6\DSP\dataset"
+import kagglehub
 
-# Optional: verify structure
-if not os.path.exists(DATASET_PATH):
-    raise FileNotFoundError(f"Dataset path not found: {DATASET_PATH}")
+print("Downloading dataset from Kaggle...")
+_dl_root = kagglehub.dataset_download("neehakurelli/google-speech-commands")
 
-print(f"Using LOCAL dataset path: {DATASET_PATH}")
+DATASET_PATH = _dl_root
+for _root, _dirs, _files in os.walk(_dl_root):
+    if "yes" in _dirs and "no" in _dirs:
+        DATASET_PATH = _root
+        break
+
+print(f"Dataset ready at: {DATASET_PATH}")
 selected_words = ["yes", "no"]
 
 

@@ -9,6 +9,7 @@ import joblib
 import time
 from tabulate import tabulate
 import matplotlib.pyplot as plt
+import psutil
 
 
 # ==============================
@@ -120,6 +121,30 @@ def extract_features(audio, sr=16000):
     features = np.mean(mfcc.T, axis=0)
     return features
 
+# ==============================
+# RESOURCE MEASUREMENT HELPERS
+# ==============================
+
+# Set this to your CPU's TDP in watts.
+# Check: https://www.cpubenchmark.net/ or your laptop specs.
+# Common values: i5 laptop = 15W, i7 laptop = 28W, Ryzen 5 = 15W
+CPU_TDP_WATTS = 15.0
+
+def get_ram_mb():
+    """Current process memory in MB."""
+    return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+
+def get_cpu_percent():
+    """CPU% for this process. Call once before, once after inference."""
+    return psutil.Process(os.getpid()).cpu_percent(interval=0.05)
+
+def estimate_energy_mj(cpu_percent, duration_seconds):
+    """
+    Approximate energy in millijoules.
+    Formula: TDP * (cpu% / 100) * time * 1000
+    This is an estimate — actual measurement needs hardware probes.
+    """
+    return CPU_TDP_WATTS * (cpu_percent / 100.0) * duration_seconds * 1000.0
 
 # ==============================
 # LOAD MODELS (FIXED VERSION)
@@ -186,16 +211,25 @@ def load_snn_model():
 # PREDICTIONS WITH SNN METRICS
 # ==============================
 def predict_traditional(model, encoder, features):
-    """Traditional model prediction"""
-    start = time.time()
+    """Traditional model prediction with resource tracking."""
     features_2d = features.reshape(1, -1)
-    pred = model.predict(features_2d)[0]
+
+    ram_before = get_ram_mb()
+    get_cpu_percent()                          # prime the counter (first call is always 0)
+
+    start = time.time()
+    pred  = model.predict(features_2d)[0]
     probs = model.predict_proba(features_2d)[0]
-    confidence = np.max(probs) * 100
-    inference_time = (time.time() - start) * 1000
+    duration = time.time() - start
+
+    cpu_pct       = get_cpu_percent()
+    ram_after     = get_ram_mb()
+    confidence    = float(np.max(probs)) * 100
+    inference_ms  = duration * 1000
+    energy_mj     = estimate_energy_mj(cpu_pct, duration)
 
     word = encoder.inverse_transform([pred])[0]
-    return word, confidence, inference_time
+    return word, confidence, inference_ms, cpu_pct, energy_mj, ram_before, ram_after
 
 
 def calculate_spike_rate(hidden_spikes, output_spikes, timesteps=30):
@@ -238,36 +272,35 @@ def estimate_energy(spike_rate, total_spikes, features, num_classes=2):
 
 
 def predict_snn(model, features, X_min, X_max, idx_to_label):
-    """SNN prediction with spike rate and energy tracking"""
-    start = time.time()
-
-    # Normalize features (CRITICAL - same as training)
+    """SNN prediction with spike tracking and resource measurement."""
     if X_min is not None and X_max is not None:
         features = (features - X_min) / (X_max - X_min + 1e-8)
 
-    # Convert to tensor
     x = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
 
-    # Predict with spike tracking
+    ram_before = get_ram_mb()
+    get_cpu_percent()                          # prime the counter
+
+    start = time.time()
     with torch.no_grad():
-        model.reset()  # Reset neuron states
+        model.reset()
         output, hidden_spikes, output_spikes = model(x)
-        probs = torch.softmax(output, dim=1)
+        probs      = torch.softmax(output, dim=1)
         confidence = torch.max(probs).item() * 100
-        pred_idx = torch.argmax(output, dim=1).item()
+        pred_idx   = torch.argmax(output, dim=1).item()
+    duration = time.time() - start
 
-    inference_time = (time.time() - start) * 1000
+    cpu_pct      = get_cpu_percent()
+    ram_after    = get_ram_mb()
+    inference_ms = duration * 1000
+    energy_mj    = estimate_energy_mj(cpu_pct, duration)
 
-    # Calculate spike metrics
-    spike_rate, total_spikes = calculate_spike_rate(hidden_spikes, output_spikes, timesteps=model.timesteps)
+    spike_rate, total_spikes = calculate_spike_rate(
+        hidden_spikes, output_spikes, timesteps=model.timesteps
+    )
 
-    # Estimate energy
-    snn_energy, trad_energy = estimate_energy(spike_rate, total_spikes, features)
-
-    # FIXED: Use reversed mapping
     word = idx_to_label.get(pred_idx, 'unknown')
-    return word, confidence, inference_time, spike_rate, total_spikes, snn_energy, trad_energy
-
+    return word, confidence, inference_ms, cpu_pct, energy_mj, ram_before, ram_after, spike_rate, total_spikes
 
 # ==============================
 # RESULTS TRACKING WITH ENHANCED METRICS
@@ -276,8 +309,12 @@ class ComparisonTracker:
     def __init__(self):
         self.results = []
 
-    def add_result(self, true_label, trad_pred, snn_pred, trad_conf, snn_conf,
-                   trad_time, snn_time, spike_rate, snn_energy, trad_energy):
+    def add_result(self, true_label, trad_pred, snn_pred,
+                   trad_conf, snn_conf,
+                   trad_time, snn_time,
+                   spike_rate, snn_energy_mj, trad_energy_mj,
+                   trad_cpu=0, snn_cpu=0,
+                   trad_ram_delta=0, snn_ram_delta=0):
         self.results.append({
             'true': true_label,
             'trad_pred': trad_pred,
@@ -289,8 +326,12 @@ class ComparisonTracker:
             'trad_time': trad_time,
             'snn_time': snn_time,
             'spike_rate': spike_rate,
-            'snn_energy': snn_energy,
-            'trad_energy': trad_energy
+            'snn_energy': snn_energy_mj,
+            'trad_energy': trad_energy_mj,
+            'trad_cpu': trad_cpu,
+            'snn_cpu': snn_cpu,
+            'trad_ram_delta': trad_ram_delta,
+            'snn_ram_delta': snn_ram_delta,
         })
 
     def get_metrics(self):
@@ -308,7 +349,9 @@ class ComparisonTracker:
                 'avg_time': np.mean([r['trad_time'] for r in self.results]),
                 'avg_conf': np.mean([r['trad_conf'] for r in self.results]),
                 'correct': trad_correct,
-                'avg_energy': np.mean([r['trad_energy'] for r in self.results])
+                'avg_energy': np.mean([r['trad_energy'] for r in self.results]),
+                'avg_cpu': np.mean([r['trad_cpu'] for r in self.results]),
+                'avg_ram_delta': np.mean([r['trad_ram_delta'] for r in self.results]),
             },
             'snn': {
                 'accuracy': snn_correct / n * 100,
@@ -316,7 +359,9 @@ class ComparisonTracker:
                 'avg_conf': np.mean([r['snn_conf'] for r in self.results]),
                 'correct': snn_correct,
                 'avg_spike_rate': np.mean([r['spike_rate'] for r in self.results]),
-                'avg_energy': np.mean([r['snn_energy'] for r in self.results])
+                'avg_energy': np.mean([r['snn_energy'] for r in self.results]),
+                'avg_cpu': np.mean([r['snn_cpu'] for r in self.results]),
+                'avg_ram_delta': np.mean([r['snn_ram_delta'] for r in self.results]),
             }
         }
 
@@ -641,25 +686,31 @@ def main():
         features = extract_features(audio)
 
         # Traditional prediction
-        trad_word, trad_conf, trad_time = predict_traditional(trad_model, encoder, features)
+        (trad_word, trad_conf, trad_time,
+         trad_cpu, trad_energy, trad_ram_before, trad_ram_after) = predict_traditional(
+            trad_model, encoder, features)
         trad_correct = trad_word == true_label
-        trad_energy = len(features) * 2 * 10  # features * classes * ENERGY_PER_MAC
+        trad_ram_delta = trad_ram_after - trad_ram_before
 
-        # SNN prediction (if available)
+        # SNN prediction
         if snn_model:
-            snn_word, snn_conf, snn_time, spike_rate, total_spikes, snn_energy, _ = predict_snn(
-                snn_model, features, X_min, X_max, idx_to_label
-            )
+            (snn_word, snn_conf, snn_time,
+             snn_cpu, snn_energy, snn_ram_before, snn_ram_after,
+             spike_rate, total_spikes) = predict_snn(
+                snn_model, features, X_min, X_max, idx_to_label)
             snn_correct = snn_word == true_label
+            snn_ram_delta = snn_ram_after - snn_ram_before
         else:
-            snn_word, snn_conf, snn_time, spike_rate, snn_energy, snn_correct = "N/A", 0, 0, 0, 0, False
-            trad_energy = 0
+            snn_word, snn_conf, snn_time = "N/A", 0, 0
+            snn_cpu, snn_energy, snn_ram_delta = 0, 0, 0
+            spike_rate, total_spikes, snn_correct = 0, 0, False
 
-        # Store results
         tracker.add_result(true_label, trad_word, snn_word,
                            trad_conf, snn_conf,
                            trad_time, snn_time,
-                           spike_rate, snn_energy, trad_energy)
+                           spike_rate, snn_energy, trad_energy,
+                           trad_cpu, snn_cpu,
+                           trad_ram_delta, snn_ram_delta)
 
         # Display
         print_results(true_label, trad_word, trad_conf, trad_time, trad_correct,
@@ -679,7 +730,7 @@ def main():
 if __name__ == "__main__":
     # Check for required packages
     missing_packages = []
-    for package in ['sounddevice', 'tabulate', 'matplotlib', 'soundfile']:
+    for package in ['sounddevice', 'tabulate', 'matplotlib', 'soundfile', 'psutil']:
         try:
             __import__(package)
         except ImportError:
